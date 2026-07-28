@@ -14,7 +14,7 @@ import sys
 import tarfile
 import filecmp
 import getpass
-import shutil
+import xml.etree.ElementTree as ET
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,11 +37,13 @@ log = logging.getLogger(__name__)
  2. --clientAccount: client account name
  3. --username     : admin mission control user
 
+ Set $MISSION_CONTROL_PASSWORD to skip the interactive password prompt.
+
  Optional arguments:
  --local-project-path   : path to local XM project (default: cwd)
  --dry-run              : resolve environment/backups without downloading anything
- --existing-backup      : path to a previously downloaded backup to skip re-download
- --existing-distribution: path to a previously downloaded distribution to skip re-download
+ --backup               : path to a previously downloaded backup to skip re-download
+ --dist                 : path to a previously downloaded distribution to skip re-download
 
  Steps performed:
  1.  Verify bare minimum system prerequisites: java, mysql, maven
@@ -68,10 +70,15 @@ argparser.add_argument('--local-project-path', action='store', default=os.getcwd
                        help='path to local XM project root (default: current directory)')
 argparser.add_argument('--dry-run', action='store_true', default=False,
                        help='resolve environment and backups without downloading anything')
-argparser.add_argument('--existing-backup', action='store', default=None,
+argparser.add_argument('--backup', action='store', default=None,
                        help='path to an existing backup file — skips backup download')
-argparser.add_argument('--existing-distribution', action='store', default=None,
+argparser.add_argument('--dist', action='store', default=None,
                        help='path to an existing distribution file — skips distribution download')
+argparser.add_argument('--skip-dist-check', action='store_true', default=False,
+                       help='load the backup into the local checkout as-is, without downloading, '
+                            'building, or comparing the distribution — use this to see how a local '
+                            'checkout behaves against a remote DB backup, regardless of parity '
+                            'with what is actually deployed')
 argparser.set_defaults(feature=True)
 
 # Populated by main() — declared here so functions below resolve them as
@@ -87,6 +94,25 @@ REQUEST_TIMEOUT = 30       # seconds per HTTP request
 DOWNLOAD_MAX_RETRIES = 3   # attempts per file download before giving up
 DOWNLOAD_RETRY_BACKOFF = 5  # seconds between download retries
 
+MYSQL_SERVICE_START_TIMEOUT = 30   # seconds to wait for the start command itself
+MYSQL_START_WAIT_ATTEMPTS = 10     # polls for MySQL to become reachable after starting it
+MYSQL_START_WAIT_DELAY_SECONDS = 2  # seconds between those polls
+
+MISSION_CONTROL_PASSWORD_ENV_VAR = 'MISSION_CONTROL_PASSWORD'
+
+# Values matching this project's own working Docker MySQL path
+# (src/main/docker/Dockerfile's REPO_WORKSPACE_BUNDLE_CACHE / REPO_VERSIONING_BUNDLE_CACHE
+# and MYSQL_DB_DRIVER), reused here so a local cargo.run matches it.
+MYSQL_LOCAL_CLUSTER_NODE_ID = 'local'
+MYSQL_LOCAL_REPO_WORKSPACE_BUNDLE_CACHE = '256'
+MYSQL_LOCAL_REPO_VERSIONING_BUNDLE_CACHE = '64'
+MYSQL_JDBC_DRIVER_CLASS = 'com.mysql.cj.jdbc.Driver'
+MYSQL_CONNECTOR_ARTIFACT_ID = 'mysql-connector-j'
+
+JAVA_VERSION_PROPERTY_NAMES = (
+    'java.version', 'maven.compiler.release', 'maven.compiler.target', 'maven.compiler.source')
+SDKMAN_JAVA_CANDIDATES_DIR = os.path.expanduser('~/.sdkman/candidates/java')
+
 
 def verifyBareSystemMinimum():
     missing = [tool for tool in ('mysql', 'java', 'mvn') if which(tool) is None]
@@ -94,6 +120,21 @@ def verifyBareSystemMinimum():
         log.error('Missing required tools: %s', ', '.join(missing))
         return False
     return True
+
+
+def _resolveMissionControlPassword(username):
+    """Mission Control password from $MISSION_CONTROL_PASSWORD if set (avoids
+    retyping it on every run), otherwise an interactive prompt.
+
+    The env var is visible to anything that can read this process's
+    environment (e.g. `ps eww`, child processes) — only set it in a private
+    shell profile, not inline on a shared machine.
+    """
+    envPassword = os.environ.get(MISSION_CONTROL_PASSWORD_ENV_VAR)
+    if envPassword:
+        log.info('Using Mission Control password from $%s.', MISSION_CONTROL_PASSWORD_ENV_VAR)
+        return envPassword
+    return getpass.getpass("Enter Mission Control password for '{}': ".format(username))
 
 
 class AccessToken:
@@ -249,6 +290,88 @@ def assertMysqlRunning():
         return False
 
 
+def _brewMysqlServiceName():
+    """Name of the Homebrew service running a local MySQL/MariaDB, or None
+    if Homebrew isn't installed or lists nothing matching."""
+    if which('brew') is None:
+        return None
+    try:
+        result = subprocess.run(['brew', 'services', 'list'],
+                                 capture_output=True, text=True, timeout=MYSQL_SERVICE_START_TIMEOUT)
+    except (subprocess.SubprocessError, OSError) as e:
+        log.warning("'brew services list' failed: %s", e)
+        return None
+    for line in result.stdout.splitlines()[1:]:  # skip header row
+        columns = line.split()
+        if not columns:
+            continue
+        name = columns[0]
+        if 'mysql' in name.lower() or 'mariadb' in name.lower():
+            return name
+    return None
+
+
+def _waitForMysql(attempts=MYSQL_START_WAIT_ATTEMPTS, delay=MYSQL_START_WAIT_DELAY_SECONDS):
+    """Polls assertMysqlRunning() until it succeeds or attempts run out."""
+    for attempt in range(1, attempts + 1):
+        if assertMysqlRunning():
+            return True
+        if attempt < attempts:
+            time.sleep(delay)
+    return False
+
+
+def startLocalMysql():
+    """Best-effort attempt to bring up a local MySQL, trying whichever
+    service manager this machine's install uses. Returns True once MySQL
+    is reachable, False if no known start method worked.
+    """
+    serviceName = _brewMysqlServiceName()
+    if serviceName:
+        startCmd = ['brew', 'services', 'start', serviceName]
+    elif which('mysql.server') is not None:
+        startCmd = ['mysql.server', 'start']
+    else:
+        log.warning('No known way to start MySQL automatically on this machine '
+                    '(neither a brew mysql/mariadb service nor mysql.server was found).')
+        return False
+
+    log.info("Starting MySQL via '%s'...", ' '.join(startCmd))
+    try:
+        subprocess.run(startCmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=MYSQL_SERVICE_START_TIMEOUT)
+    except (subprocess.SubprocessError, OSError) as e:
+        log.warning("'%s' failed: %s", ' '.join(startCmd), e)
+        return False
+
+    return _waitForMysql()
+
+
+def ensureMysqlRunning():
+    """Returns True if MySQL is already reachable, or becomes reachable
+    after a best-effort automatic start attempt."""
+    if assertMysqlRunning():
+        return True
+    log.info('MySQL is not running locally; attempting to start it...')
+    return startLocalMysql()
+
+
+def _ensureDatabaseExists(user, database, env):
+    """Creates `database` via CREATE DATABASE IF NOT EXISTS.
+
+    The dumps produced by this tooling are plain table dumps with no
+    CREATE DATABASE/USE statements of their own, and `mysql db < dump.sql`
+    requires db to already exist — so a first-time destination name would
+    otherwise fail with "Unknown database".
+    """
+    escapedName = database.replace('`', '``')
+    cmd = ['mysql', '-u', user, '-h', 'localhost', '-e',
+           'CREATE DATABASE IF NOT EXISTS `{}`'.format(escapedName)]
+    result = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError("Could not create database '{}': {}".format(database, result.stderr.strip()))
+
+
 def loadBackupLocalMySQL(backupPath):
     print('Enter destination database user:')
     dest_user = input().strip()
@@ -257,16 +380,152 @@ def loadBackupLocalMySQL(backupPath):
     print('Enter destination database name:')
     dest_database = input().strip()
 
-    cmd = ['mysql', '-u', dest_user, '-h', 'localhost',
-           '--default-character-set=utf8', dest_database]
     env = os.environ.copy()
     env['MYSQL_PWD'] = dest_password  # avoids password in process list / shell history
 
-    with open(backupPath, 'rb') as backup_file:
-        result = subprocess.run(cmd, stdin=backup_file, env=env)
+    _ensureDatabaseExists(dest_user, dest_database, env)
 
+    cmd = ['mysql', '-u', dest_user, '-h', 'localhost',
+           '--default-character-set=utf8', '--binary-mode', dest_database]
+
+    # backupPath is the .gz file downloaded from Mission Control — piping it
+    # into mysql directly feeds it raw compressed bytes instead of SQL text.
+    gunzip = subprocess.Popen(['gunzip', '-c', backupPath], stdout=subprocess.PIPE)
+    try:
+        result = subprocess.run(cmd, stdin=gunzip.stdout, env=env)
+    finally:
+        gunzip.stdout.close()
+        gunzip.wait()
+
+    if gunzip.returncode != 0:
+        raise RuntimeError('gunzip failed with exit code {}.'.format(gunzip.returncode))
     if result.returncode != 0:
         raise RuntimeError('mysql import failed with exit code {}.'.format(result.returncode))
+
+    return dest_user, dest_password, dest_database
+
+
+def _readFile(path):
+    with open(path, 'r') as f:
+        return f.read()
+
+
+def _writeFile(path, content):
+    with open(path, 'w') as f:
+        f.write(content)
+
+
+def _resolveRepositoryMysqlTemplate(templateContent, database):
+    return (templateContent
+            .replace('@mysql.repo.db@', database)
+            .replace('@cluster.node.id@', MYSQL_LOCAL_CLUSTER_NODE_ID)
+            .replace('@repo.workspace.bundle.cache@', MYSQL_LOCAL_REPO_WORKSPACE_BUNDLE_CACHE)
+            .replace('@repo.versioning.bundle.cache@', MYSQL_LOCAL_REPO_VERSIONING_BUNDLE_CACHE))
+
+
+def _contextXmlHasMysqlResource(contextXmlPath, database):
+    resourceName = 'jdbc/{}'.format(database)
+    root = ET.parse(contextXmlPath).getroot()
+    return any(resource.get('name') == resourceName for resource in root.iter('Resource'))
+
+
+def _buildMysqlContextResource(user, password, database):
+    return (
+        '    <Resource\n'
+        '      name="jdbc/{database}" auth="Container" type="javax.sql.DataSource"\n'
+        '      maxTotal="20" maxIdle="10" initialSize="2" maxWaitMillis="10000"\n'
+        '      testWhileIdle="true" testOnBorrow="false" validationQuery="SELECT 1"\n'
+        '      timeBetweenEvictionRunsMillis="10000"\n'
+        '      minEvictableIdleTimeMillis="60000"\n'
+        '      username="{user}" password="{password}"\n'
+        '      driverClassName="{driver}"\n'
+        '      url="jdbc:mysql://localhost:3306/{database}'
+        '?characterEncoding=utf8&amp;useSSL=false&amp;allowPublicKeyRetrieval=true"/>\n'
+    ).format(database=database, user=user, password=password, driver=MYSQL_JDBC_DRIVER_CLASS)
+
+
+def _addMysqlResourceToContextXml(contextXmlPath, user, password, database):
+    if _contextXmlHasMysqlResource(contextXmlPath, database):
+        return False
+    content = _readFile(contextXmlPath)
+    resourceXml = _buildMysqlContextResource(user, password, database)
+    _writeFile(contextXmlPath, content.replace('</Context>', resourceXml + '</Context>', 1))
+    return True
+
+
+def _addRepoConfigSystemProperty(pomXmlPath):
+    content = _readFile(pomXmlPath)
+    if '<repo.config>' in content:
+        return False
+    anchor = '<log4j.configurationFile>${project.basedir}/conf/log4j2-dev.xml</log4j.configurationFile>'
+    if anchor not in content:
+        log.warning("Could not find the expected cargo.run systemProperties anchor in '%s'; "
+                    'skipping repo.config wiring.', pomXmlPath)
+        return False
+    replacement = anchor + '\n                  <repo.config>${project.basedir}/conf/repository.xml</repo.config>'
+    _writeFile(pomXmlPath, content.replace(anchor, replacement, 1))
+    return True
+
+
+def _addMysqlConnectorDependency(cmsPomPath):
+    content = _readFile(cmsPomPath)
+    if '<artifactId>{}</artifactId>'.format(MYSQL_CONNECTOR_ARTIFACT_ID) in content:
+        return False
+    closing = '  </dependencies>'
+    if closing not in content:
+        log.warning("Could not find '</dependencies>' in '%s'; skipping mysql-connector-j wiring.", cmsPomPath)
+        return False
+    dependencyXml = (
+        '    <dependency>\n'
+        '      <groupId>com.mysql</groupId>\n'
+        '      <artifactId>{}</artifactId>\n'
+        '      <scope>provided</scope>\n'
+        '    </dependency>\n'
+    ).format(MYSQL_CONNECTOR_ARTIFACT_ID)
+    _writeFile(cmsPomPath, content.replace(closing, dependencyXml + closing, 1))
+    return True
+
+
+def _fixDockerMysqlConnectorCoordinates(dockerDbLibsPath):
+    content = _readFile(dockerDbLibsPath)
+    stale = 'mysql:mysql-connector-java'
+    if stale not in content:
+        return False
+    _writeFile(dockerDbLibsPath, content.replace(stale, 'com.mysql:{}'.format(MYSQL_CONNECTOR_ARTIFACT_ID)))
+    return True
+
+
+def configureLocalProjectForMysql(projectPath, user, password, database):
+    """Wires a local checkout's cargo.run to read from a locally-imported
+    MySQL backup, if it isn't already configured to.
+
+    conf/repository.xml existing is treated as "already configured" — a
+    no-op that leaves everything untouched. Each individual step below is
+    independently idempotent too, so a partially-configured project only
+    gets what it's missing.
+    """
+    repositoryXmlPath = os.path.join(projectPath, 'conf', 'repository.xml')
+    if os.path.isfile(repositoryXmlPath):
+        log.info("'%s' already exists; leaving local MySQL configuration as-is.", repositoryXmlPath)
+        return False
+
+    repositoryTemplatePath = os.path.join(projectPath, 'conf', 'repository-mysql.xml')
+    contextTemplatePath = os.path.join(projectPath, 'conf', 'context-mysql.xml')
+    if not os.path.isfile(repositoryTemplatePath) or not os.path.isfile(contextTemplatePath):
+        log.warning("'%s' has no conf/repository-mysql.xml / conf/context-mysql.xml templates; "
+                    'skipping local MySQL auto-configuration.', projectPath)
+        return False
+
+    _writeFile(repositoryXmlPath, _resolveRepositoryMysqlTemplate(_readFile(repositoryTemplatePath), database))
+    _addMysqlResourceToContextXml(os.path.join(projectPath, 'conf', 'context.xml'), user, password, database)
+    _addRepoConfigSystemProperty(os.path.join(projectPath, 'pom.xml'))
+    _addMysqlConnectorDependency(os.path.join(projectPath, 'cms', 'pom.xml'))
+    _fixDockerMysqlConnectorCoordinates(
+        os.path.join(projectPath, 'src', 'main', 'docker', 'assembly', 'docker-db-libs.xml'))
+
+    log.info("Configured '%s' to read from local MySQL database '%s' "
+             '(run `mvn clean install` before `mvn -Pcargo.run`).', projectPath, database)
+    return True
 
 
 def getDistributionDownloadToken(distributionId, token):
@@ -334,10 +593,101 @@ def _diff_directories(left, right):
     return sorted(left_files - right_files), sorted(right_files - left_files), diff_files
 
 
+def _pom_local_tag(element):
+    return element.tag.rsplit('}', 1)[-1]
+
+
+def _normalizeJavaMajorVersion(version):
+    """'1.8' -> '8', '17' -> '17', '11.0.2' -> '11'."""
+    parts = version.split('.')
+    if len(parts) >= 2 and parts[0] == '1':
+        return parts[1]
+    return parts[0]
+
+
+def getRequiredJavaVersion(projectPath):
+    """Best-effort read of the project's declared Java version from pom.xml.
+
+    Returns a normalized major version string (e.g. '17') or None if the
+    project has no pom.xml, or none of the commonly-used version properties
+    are declared in it — callers should treat None as "unknown" and leave
+    whatever JDK is already active rather than guess.
+    """
+    pom_path = os.path.join(projectPath, 'pom.xml')
+    if not os.path.isfile(pom_path):
+        return None
+    try:
+        root = ET.parse(pom_path).getroot()
+    except ET.ParseError:
+        return None
+    properties = next((child for child in root if _pom_local_tag(child) == 'properties'), None)
+    if properties is None:
+        return None
+    declared = {_pom_local_tag(prop): (prop.text or '').strip() for prop in properties}
+    for name in JAVA_VERSION_PROPERTY_NAMES:
+        if declared.get(name):
+            return _normalizeJavaMajorVersion(declared[name])
+    return None
+
+
+def _sdkmanCandidateMajorVersion(candidateName):
+    """SDKMAN candidate dir names look like '17.0.9-tem', '1.8.0_392-zulu'."""
+    return _normalizeJavaMajorVersion(candidateName.split('-', 1)[0])
+
+
+def findSdkmanJavaHome(majorVersion):
+    """Find an SDKMAN-installed JDK candidate matching majorVersion (e.g. '17').
+
+    Returns the candidate's absolute path, or None if SDKMAN isn't installed
+    or no installed candidate matches.
+    """
+    if not os.path.isdir(SDKMAN_JAVA_CANDIDATES_DIR):
+        return None
+    matches = sorted(
+        name for name in os.listdir(SDKMAN_JAVA_CANDIDATES_DIR)
+        if name != 'current' and _sdkmanCandidateMajorVersion(name) == majorVersion
+    )
+    if not matches:
+        return None
+    return os.path.join(SDKMAN_JAVA_CANDIDATES_DIR, matches[-1])
+
+
+def _mvnEnvironmentForProject(projectPath):
+    """Build the subprocess environment for `mvn`, switched to the project's
+    declared Java version via an SDKMAN-installed candidate when possible.
+
+    Only affects the environment passed to the mvn subprocess — never the
+    parent shell — so it composes safely regardless of whichever JDK the
+    invoking shell currently has active.
+    """
+    env = os.environ.copy()
+    requiredVersion = getRequiredJavaVersion(projectPath)
+    if requiredVersion is None:
+        log.info('No Java version declared in pom.xml; using the currently active JDK.')
+        return env
+
+    javaHome = findSdkmanJavaHome(requiredVersion)
+    if javaHome is None:
+        log.warning("Project requires Java %s but no matching SDKMAN candidate is installed "
+                    "under '%s'; using the currently active JDK. Install it with "
+                    "'sdk install java %s'.", requiredVersion, SDKMAN_JAVA_CANDIDATES_DIR, requiredVersion)
+        return env
+
+    log.info("Using SDKMAN-managed Java %s for the build ('%s').", requiredVersion, javaHome)
+    env['JAVA_HOME'] = javaHome
+    env['PATH'] = os.path.join(javaHome, 'bin') + os.pathsep + env.get('PATH', '')
+    return env
+
+
+def _runMavenBuild(projectPath):
+    env = _mvnEnvironmentForProject(projectPath)
+    subprocess.check_call(['mvn', 'clean', 'install'], cwd=projectPath, env=env)
+    subprocess.check_call(['mvn', '-Pdist'], cwd=projectPath, env=env)
+
+
 def buildDistributionAndCompare(projectPath, remoteExtractedPath):
     """Build local distribution and compare extracted contents with the remote."""
-    subprocess.check_call(['mvn', 'clean', 'install'], cwd=projectPath)
-    subprocess.check_call(['mvn', '-Pdist'], cwd=projectPath)
+    _runMavenBuild(projectPath)
 
     local_tarballs = glob.glob(os.path.join(projectPath, 'target', '*.tar.gz'))
     if not local_tarballs:
@@ -362,31 +712,44 @@ def main():
 
     args = argparser.parse_args()
     USER = args.username
-    PASS = getpass.getpass("Enter Mission Control password for '{}': ".format(USER))
     CLIENT = args.clientAccount
     ENV = args.remoteEnv
     LOCAL_PROJECT_PATH = args.local_project_path
     API = 'https://api.{}.bloomreach.cloud'.format(CLIENT)
 
-    downloaded_files = []
-    extracted_dirs = []
-    try:
-        token = authenticateCloudAPI(USER, PASS)
-        environments = listEnvironments(token)
-        environmentId, distributionId = getEnvironmentDistributionId(environments, ENV)
-        log.info("Resolved environment '%s' (id=%s, distributionId=%s)",
-                 ENV, environmentId, distributionId)
+    # Nothing from Mission Control (a token, environment/distribution ids) is
+    # needed once every artifact this run actually uses is already on disk —
+    # except for --dry-run, whose entire purpose is validating that auth and
+    # environment resolution succeed. --skip-dist-check never uses the
+    # distribution at all, so --dist isn't part of that requirement then.
+    neededArtifactsOnDisk = bool(args.backup) if args.skip_dist_check else bool(args.backup and args.dist)
+    needsAuth = not neededArtifactsOnDisk or args.dry_run
 
-        if args.dry_run:
-            log.info('Dry-run mode: skipping downloads. Exiting.')
-            return
+    downloaded_files = []
+    try:
+        token = environmentId = distributionId = None
+        if needsAuth:
+            PASS = _resolveMissionControlPassword(USER)
+            token = authenticateCloudAPI(USER, PASS)
+            environments = listEnvironments(token)
+            environmentId, distributionId = getEnvironmentDistributionId(environments, ENV)
+            log.info("Resolved environment '%s' (id=%s, distributionId=%s)",
+                     ENV, environmentId, distributionId)
+
+            if args.dry_run:
+                log.info('Dry-run mode: skipping downloads. Exiting.')
+                return
+        elif args.skip_dist_check:
+            log.info("--backup provided with --skip-dist-check; skipping Mission Control authentication.")
+        else:
+            log.info("Both --backup and --dist provided; skipping Mission Control authentication.")
 
         if not verifyBareSystemMinimum():
             sys.exit(1)
 
         # --- Backup ---
-        if args.existing_backup:
-            backupPath = args.existing_backup
+        if args.backup:
+            backupPath = args.backup
             log.info("Using existing backup: %s", backupPath)
         else:
             backups = listBackups(token)
@@ -397,9 +760,22 @@ def main():
                                         dest_dir=LOCAL_PROJECT_PATH)
             downloaded_files.append(backupPath)
 
+        if args.skip_dist_check:
+            log.warning('--skip-dist-check set: loading the backup into the local checkout as-is, '
+                        'without verifying it matches what is actually deployed remotely.')
+            if not ensureMysqlRunning():
+                log.error("Could not start MySQL. Start it manually and re-run with "
+                          "--backup '%s'.", backupPath)
+                sys.exit(1)
+            dest_user, dest_password, dest_database = loadBackupLocalMySQL(backupPath)
+            log.info("Loaded '%s' into local MySQL.", backupPath)
+            configureLocalProjectForMysql(LOCAL_PROJECT_PATH, dest_user, dest_password, dest_database)
+            log.info("To start the local checkout, run: mvn clean install && mvn -Pcargo.run")
+            return
+
         # --- Distribution ---
-        if args.existing_distribution:
-            distributionPath = args.existing_distribution
+        if args.dist:
+            distributionPath = args.dist
             log.info("Using existing distribution: %s", distributionPath)
         else:
             distributionDownloadToken = getDistributionDownloadToken(distributionId, token)
@@ -410,33 +786,30 @@ def main():
             downloaded_files.append(distributionPath)
 
         extractLocation = extractDistribution(distributionPath, dest=LOCAL_PROJECT_PATH)
-        extracted_dirs.append(extractLocation)
 
         if buildDistributionAndCompare(LOCAL_PROJECT_PATH, extractLocation):
             log.info('Local distribution has parity with remote distribution.')
-            if not assertMysqlRunning():
-                log.error("MySQL is not running. Start MySQL and re-run with "
-                          "--existing-backup '%s' --existing-distribution '%s'.",
+            if not ensureMysqlRunning():
+                log.error("Could not start MySQL. Start it manually and re-run with "
+                          "--backup '%s' --dist '%s'.",
                           backupPath, distributionPath)
                 sys.exit(1)
-            loadBackupLocalMySQL(backupPath)
+            dest_user, dest_password, dest_database = loadBackupLocalMySQL(backupPath)
             log.info("Loaded '%s' into local MySQL.", backupPath)
+            configureLocalProjectForMysql(LOCAL_PROJECT_PATH, dest_user, dest_password, dest_database)
             log.info("To start the cloned '%s' environment, run: mvn clean install && mvn -Pcargo.run", ENV)
         else:
-            log.error("Local distribution does not match remote. Inspect '%s' for differences.",
-                      extractLocation)
+            log.error("Local distribution does not match remote (see '%s' for differences); "
+                      'discarding the downloaded backup/distribution since they do not '
+                      'correspond to this local checkout.', extractLocation)
+            for f in downloaded_files:
+                if os.path.exists(f):
+                    log.info('Cleaning up: %s', f)
+                    os.remove(f)
             sys.exit(1)
 
     except Exception:
         log.exception('Fatal error')
-        for f in downloaded_files:
-            if os.path.exists(f):
-                log.info("Cleaning up partial download: %s", f)
-                os.remove(f)
-        for d in extracted_dirs:
-            if os.path.isdir(d):
-                log.info("Cleaning up extracted directory: %s", d)
-                shutil.rmtree(d, ignore_errors=True)
         sys.exit(1)
 
 
