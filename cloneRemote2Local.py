@@ -462,7 +462,11 @@ def _addRepoConfigSystemProperty(pomXmlPath):
         log.warning("Could not find the expected cargo.run systemProperties anchor in '%s'; "
                     'skipping repo.config wiring.', pomXmlPath)
         return False
-    replacement = anchor + '\n                  <repo.config>${project.basedir}/conf/repository.xml</repo.config>'
+    # LocalHippoRepository.getRepositoryConfigAsStream only opens this value
+    # as a filesystem File if it starts with the literal "file:" prefix —
+    # otherwise it's treated as a classpath resource lookup, which resolves
+    # to null here and NPEs on openStream().
+    replacement = anchor + '\n                  <repo.config>file:${project.basedir}/conf/repository.xml</repo.config>'
     _writeFile(pomXmlPath, content.replace(anchor, replacement, 1))
     return True
 
@@ -495,37 +499,162 @@ def _fixDockerMysqlConnectorCoordinates(dockerDbLibsPath):
     return True
 
 
+def _addMysqlConnectorToCargoContainerClasspath(pomXmlPath):
+    """Adds mysql-connector-j to cargo.run's container classpath.
+
+    A `provided`-scope dependency on the webapp alone isn't enough: cargo's
+    embedded Tomcat needs the driver on its OWN classpath, because DBCP
+    loads the driver class itself (outside any webapp's classloader) when
+    registering the JDBC JNDI <Resource> declared in context.xml. Mirrors
+    the existing shared-classpath dependencies already in that container
+    config (hippo-addon-targeting-shared-api / hippo-enterprise-services).
+    """
+    content = _readFile(pomXmlPath)
+    marker = '<artifactId>{}</artifactId>\n                    <classpath>shared</classpath>'.format(
+        MYSQL_CONNECTOR_ARTIFACT_ID)
+    if marker in content:
+        return False
+    anchor = (
+        '                  <dependency>\n'
+        '                    <groupId>com.onehippo.cms7</groupId>\n'
+        '                    <artifactId>hippo-enterprise-services</artifactId>\n'
+        '                    <classpath>shared</classpath>\n'
+        '                  </dependency>\n'
+        '                </dependencies>'
+    )
+    if anchor not in content:
+        log.warning("Could not find the expected cargo.run container dependencies anchor in '%s'; "
+                    'skipping mysql-connector-j container classpath wiring.', pomXmlPath)
+        return False
+    dependencyXml = (
+        '                  <dependency>\n'
+        '                    <groupId>com.mysql</groupId>\n'
+        '                    <artifactId>{}</artifactId>\n'
+        '                    <classpath>shared</classpath>\n'
+        '                  </dependency>\n'
+        '                </dependencies>'
+    ).format(MYSQL_CONNECTOR_ARTIFACT_ID)
+    replacement = anchor[:-len('                </dependencies>')] + dependencyXml
+    _writeFile(pomXmlPath, content.replace(anchor, replacement, 1))
+    return True
+
+
+def _addMysqlConnectorToRootPomDependencies(pomXmlPath):
+    """Declares mysql-connector-j as a real (provided-scope) dependency of
+    the root project.
+
+    cargo rejects a classpath=shared container entry unless the artifact is
+    ALSO a resolved dependency of the project running cargo:start — exactly
+    how hippo-addon-targeting-shared-api / hippo-enterprise-services are
+    declared both here and in the container classpath list.
+    """
+    content = _readFile(pomXmlPath)
+    marker = '<artifactId>{}</artifactId>\n      <scope>provided</scope>'.format(MYSQL_CONNECTOR_ARTIFACT_ID)
+    if marker in content:
+        return False
+    anchor = (
+        '    <dependency>\n'
+        '      <groupId>com.onehippo.cms7</groupId>\n'
+        '      <artifactId>hippo-enterprise-services</artifactId>\n'
+        '      <scope>provided</scope>\n'
+        '    </dependency>\n'
+        '  </dependencies>'
+    )
+    if anchor not in content:
+        log.warning("Could not find the expected root dependencies anchor in '%s'; "
+                    'skipping mysql-connector-j root dependency wiring.', pomXmlPath)
+        return False
+    dependencyXml = (
+        '    <dependency>\n'
+        '      <groupId>com.mysql</groupId>\n'
+        '      <artifactId>{}</artifactId>\n'
+        '      <scope>provided</scope>\n'
+        '    </dependency>\n'
+        '  </dependencies>'
+    ).format(MYSQL_CONNECTOR_ARTIFACT_ID)
+    replacement = anchor[:-len('  </dependencies>')] + dependencyXml
+    _writeFile(pomXmlPath, content.replace(anchor, replacement, 1))
+    return True
+
+
+def _addMysqlConnectorJarToCommonLib(pomXmlPath):
+    """Copies the resolved mysql-connector-j jar straight into Tomcat's
+    common/lib, bypassing cargo's classpath=shared dependency mechanism.
+
+    That mechanism only understands Tomcat 6/7's shared/lib classloader
+    tier — confirmed by decompiling cargo's own Dependency.class (classpath
+    type is only ever "shared" or "extra") and this project's actual
+    Tomcat 9 Bootstrap/ClassLoaderFactory classes (no "shared" references
+    at all; only common.loader, which DOES include common/lib, is read).
+    Mirrors the existing <files> entries already used to deploy the
+    repository-data development jars.
+    """
+    content = _readFile(pomXmlPath)
+    jarPath = ('${{settings.localRepository}}/com/mysql/{artifact}/${{mysql.version}}/'
+               '{artifact}-${{mysql.version}}.jar').format(artifact=MYSQL_CONNECTOR_ARTIFACT_ID)
+    if jarPath in content:
+        return False
+    anchor = (
+        '                  <file>\n'
+        '                    <file>${project.basedir}/repository-data/site-development/target/'
+        'cavco-repository-data-site-development-${project.version}.jar</file>\n'
+        '                    <todir>${development-module-deploy-dir}</todir>\n'
+        '                  </file>\n'
+        '                </files>'
+    )
+    if anchor not in content:
+        log.warning("Could not find the expected cargo.run <files> anchor in '%s'; "
+                    'skipping mysql-connector-j common/lib copy.', pomXmlPath)
+        return False
+    fileXml = (
+        '                  <file>\n'
+        '                    <file>{jarPath}</file>\n'
+        '                    <todir>common/lib</todir>\n'
+        '                  </file>\n'
+        '                </files>'
+    ).format(jarPath=jarPath)
+    replacement = anchor[:-len('                </files>')] + fileXml
+    _writeFile(pomXmlPath, content.replace(anchor, replacement, 1))
+    return True
+
+
 def configureLocalProjectForMysql(projectPath, user, password, database):
     """Wires a local checkout's cargo.run to read from a locally-imported
     MySQL backup, if it isn't already configured to.
 
-    conf/repository.xml existing is treated as "already configured" — a
-    no-op that leaves everything untouched. Each individual step below is
-    independently idempotent too, so a partially-configured project only
-    gets what it's missing.
+    conf/repository.xml existing means "don't overwrite its content" —
+    NOT "this project is fully configured": every other step below is
+    independently idempotent and still runs, so a project that already has
+    a repository.xml (from a previous run, or hand-written) still gets
+    whatever wiring it's still missing.
     """
     repositoryXmlPath = os.path.join(projectPath, 'conf', 'repository.xml')
     if os.path.isfile(repositoryXmlPath):
-        log.info("'%s' already exists; leaving local MySQL configuration as-is.", repositoryXmlPath)
-        return False
+        log.info("'%s' already exists; leaving its content as-is.", repositoryXmlPath)
+    else:
+        repositoryTemplatePath = os.path.join(projectPath, 'conf', 'repository-mysql.xml')
+        contextTemplatePath = os.path.join(projectPath, 'conf', 'context-mysql.xml')
+        if not os.path.isfile(repositoryTemplatePath) or not os.path.isfile(contextTemplatePath):
+            log.warning("'%s' has no conf/repository-mysql.xml / conf/context-mysql.xml templates; "
+                        'skipping local MySQL auto-configuration.', projectPath)
+            return False
+        _writeFile(repositoryXmlPath,
+                   _resolveRepositoryMysqlTemplate(_readFile(repositoryTemplatePath), database))
 
-    repositoryTemplatePath = os.path.join(projectPath, 'conf', 'repository-mysql.xml')
-    contextTemplatePath = os.path.join(projectPath, 'conf', 'context-mysql.xml')
-    if not os.path.isfile(repositoryTemplatePath) or not os.path.isfile(contextTemplatePath):
-        log.warning("'%s' has no conf/repository-mysql.xml / conf/context-mysql.xml templates; "
-                    'skipping local MySQL auto-configuration.', projectPath)
-        return False
+    pomXmlPath = os.path.join(projectPath, 'pom.xml')
+    changed = _addMysqlResourceToContextXml(os.path.join(projectPath, 'conf', 'context.xml'), user, password, database)
+    changed = _addRepoConfigSystemProperty(pomXmlPath) or changed
+    changed = _addMysqlConnectorToRootPomDependencies(pomXmlPath) or changed
+    changed = _addMysqlConnectorToCargoContainerClasspath(pomXmlPath) or changed
+    changed = _addMysqlConnectorJarToCommonLib(pomXmlPath) or changed
+    changed = _addMysqlConnectorDependency(os.path.join(projectPath, 'cms', 'pom.xml')) or changed
+    changed = _fixDockerMysqlConnectorCoordinates(
+        os.path.join(projectPath, 'src', 'main', 'docker', 'assembly', 'docker-db-libs.xml')) or changed
 
-    _writeFile(repositoryXmlPath, _resolveRepositoryMysqlTemplate(_readFile(repositoryTemplatePath), database))
-    _addMysqlResourceToContextXml(os.path.join(projectPath, 'conf', 'context.xml'), user, password, database)
-    _addRepoConfigSystemProperty(os.path.join(projectPath, 'pom.xml'))
-    _addMysqlConnectorDependency(os.path.join(projectPath, 'cms', 'pom.xml'))
-    _fixDockerMysqlConnectorCoordinates(
-        os.path.join(projectPath, 'src', 'main', 'docker', 'assembly', 'docker-db-libs.xml'))
-
-    log.info("Configured '%s' to read from local MySQL database '%s' "
-             '(run `mvn clean install` before `mvn -Pcargo.run`).', projectPath, database)
-    return True
+    if changed:
+        log.info("Configured '%s' to read from local MySQL database '%s' "
+                 '(run `mvn clean install` before `mvn -Pcargo.run`).', projectPath, database)
+    return changed
 
 
 def getDistributionDownloadToken(distributionId, token):

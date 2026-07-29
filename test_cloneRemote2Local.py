@@ -611,12 +611,46 @@ class ConfigureLocalProjectForMysqlTests(unittest.TestCase):
 '''
 
     POM_XML = '''<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.onehippo.cms7</groupId>
+      <artifactId>hippo-addon-targeting-shared-api</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.onehippo.cms7</groupId>
+      <artifactId>hippo-enterprise-services</artifactId>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
     <profile>
       <id>cargo.run</id>
               <systemProperties>
                   <log4j.configurationFile>${project.basedir}/conf/log4j2-dev.xml</log4j.configurationFile>
                   <project.basedir>${project.basedir}</project.basedir>
                 </systemProperties>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.onehippo.cms7</groupId>
+                    <artifactId>hippo-addon-targeting-shared-api</artifactId>
+                    <classpath>shared</classpath>
+                  </dependency>
+                  <dependency>
+                    <groupId>com.onehippo.cms7</groupId>
+                    <artifactId>hippo-enterprise-services</artifactId>
+                    <classpath>shared</classpath>
+                  </dependency>
+                </dependencies>
+                <files>
+                  <file>
+                    <file>${project.basedir}/repository-data/development/target/cavco-repository-data-development-${project.version}.jar</file>
+                    <todir>${development-module-deploy-dir}</todir>
+                  </file>
+                  <file>
+                    <file>${project.basedir}/repository-data/site-development/target/cavco-repository-data-site-development-${project.version}.jar</file>
+                    <todir>${development-module-deploy-dir}</todir>
+                  </file>
+                </files>
     </profile>
 </project>
 '''
@@ -687,7 +721,11 @@ class ConfigureLocalProjectForMysqlTests(unittest.TestCase):
         target.configureLocalProjectForMysql(self.project, 'root', 'pw', 'cavco')
 
         content = self._read('pom.xml')
-        self.assertIn('<repo.config>${project.basedir}/conf/repository.xml</repo.config>', content)
+        # LocalHippoRepository.getRepositoryConfigAsStream only opens this
+        # as a filesystem File if the value starts with the literal "file:"
+        # prefix — otherwise it's treated as a classpath resource lookup,
+        # which silently resolves to null and NPEs on openStream().
+        self.assertIn('<repo.config>file:${project.basedir}/conf/repository.xml</repo.config>', content)
         self.assertIn('log4j2-dev.xml', content)
 
     def test_adds_mysql_connector_dependency_to_cms_pom_without_disturbing_existing_content(self):
@@ -704,18 +742,68 @@ class ConfigureLocalProjectForMysqlTests(unittest.TestCase):
         self.assertIn('com.mysql:mysql-connector-j', content)
         self.assertNotIn('mysql:mysql-connector-java', content)
 
-    def test_noop_when_repository_xml_already_exists(self):
+    def test_wires_mysql_connector_into_cargo_container_classpath_without_disturbing_existing_content(self):
+        # provided scope in cms/pom.xml alone isn't enough for cargo.run:
+        # cargo's embedded Tomcat needs the driver on its OWN classpath so
+        # DBCP can load it when registering the JNDI Resource — hence the
+        # classpath=shared entry, mirroring the existing shared deps.
+        target.configureLocalProjectForMysql(self.project, 'root', 'pw', 'cavco')
+
+        content = self._read('pom.xml')
+        self.assertIn('hippo-addon-targeting-shared-api', content)
+        self.assertIn('hippo-enterprise-services', content)
+        self.assertIn(
+            '<artifactId>mysql-connector-j</artifactId>\n                    <classpath>shared</classpath>',
+            content)
+
+    def test_also_declares_mysql_connector_as_a_root_project_dependency(self):
+        # cargo rejects a classpath=shared entry unless the artifact is
+        # ALSO a real dependency of the project running cargo:start (the
+        # root module here) — exactly how hippo-addon-targeting-shared-api /
+        # hippo-enterprise-services are declared in both places already.
+        # Confirmed by the actual cargo error: "Artifact
+        # [com.mysql:mysql-connector-j:jar] is not a dependency of the
+        # project."
+        target.configureLocalProjectForMysql(self.project, 'root', 'pw', 'cavco')
+
+        content = self._read('pom.xml')
+        self.assertIn(
+            '<artifactId>mysql-connector-j</artifactId>\n      <scope>provided</scope>',
+            content)
+        self.assertEqual(content.count('<artifactId>mysql-connector-j</artifactId>'), 2)
+
+    def test_copies_the_connector_jar_into_common_lib_without_disturbing_existing_files(self):
+        # cargo-maven2-plugin's <classpath>shared</classpath> dependency
+        # mechanism only understands Tomcat 6/7's shared/lib classloader
+        # tier, which modern Tomcat 8.5+/9/10 no longer builds (confirmed:
+        # the jar landed in shared/lib but ClassNotFoundException
+        # persisted). common.loader still reads common/lib, so copy the
+        # resolved jar straight there instead.
+        target.configureLocalProjectForMysql(self.project, 'root', 'pw', 'cavco')
+
+        content = self._read('pom.xml')
+        self.assertIn(
+            '<file>${settings.localRepository}/com/mysql/mysql-connector-j/'
+            '${mysql.version}/mysql-connector-j-${mysql.version}.jar</file>',
+            content)
+        self.assertIn('<todir>common/lib</todir>', content)
+        self.assertIn('cavco-repository-data-development', content)
+        self.assertIn('cavco-repository-data-site-development', content)
+
+    def test_does_not_overwrite_a_preexisting_repository_xml_but_still_wires_the_rest(self):
+        # conf/repository.xml already existing (e.g. from a previous run, or
+        # hand-written) means "don't touch this file's content" — it does
+        # NOT mean "this project is fully configured": each other wiring
+        # step is independently idempotent and still fills in what's missing.
         self._write('conf/repository.xml', '<Repository><!-- custom, hand-written --></Repository>')
-        original_context = self._read('conf/context.xml')
-        original_pom = self._read('pom.xml')
-        original_cms_pom = self._read('cms/pom.xml')
 
         target.configureLocalProjectForMysql(self.project, 'root', 'pw', 'cavco')
 
         self.assertIn('custom, hand-written', self._read('conf/repository.xml'))
-        self.assertEqual(self._read('conf/context.xml'), original_context)
-        self.assertEqual(self._read('pom.xml'), original_pom)
-        self.assertEqual(self._read('cms/pom.xml'), original_cms_pom)
+        self.assertIn('jdbc/cavco', self._read('conf/context.xml'))
+        self.assertIn('<repo.config>', self._read('pom.xml'))
+        self.assertIn('<artifactId>mysql-connector-j</artifactId>', self._read('pom.xml'))
+        self.assertIn('mysql-connector-j</artifactId>', self._read('cms/pom.xml'))
 
     def test_noop_when_templates_are_missing(self):
         os.remove(os.path.join(self.project, 'conf', 'repository-mysql.xml'))
@@ -730,7 +818,8 @@ class ConfigureLocalProjectForMysqlTests(unittest.TestCase):
         first_pom = self._read('pom.xml')
         first_cms_pom = self._read('cms/pom.xml')
 
-        # Second call short-circuits entirely because conf/repository.xml now exists.
+        # Second call re-runs every step, but each one's own existence
+        # check finds its change already present and no-ops.
         target.configureLocalProjectForMysql(self.project, 'root', 'pw', 'cavco')
 
         self.assertEqual(self._read('conf/context.xml'), first_context)
@@ -752,6 +841,7 @@ class ConfigureLocalProjectForMysqlTests(unittest.TestCase):
 
         content = self._read('pom.xml')
         self.assertEqual(content.count('<repo.config>'), 1)
+        self.assertIn('<artifactId>mysql-connector-j</artifactId>', content)
         self.assertIn('mysql-connector-j</artifactId>', self._read('cms/pom.xml'))
 
 
