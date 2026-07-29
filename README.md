@@ -12,6 +12,11 @@ checker tool index and fix
 
 `java -jar hippo-addon-checker-<version>.jar config > checker-repository.xml`
 
+edit checker-repository:
+
+> `<param name="url" value="jdbc:mysql://localhost:3306/{{DB_NAME}}"/>`
+> 
+
 `java -jar hippo-addon-checker-<version>.jar props > checker.properties`
 
 edit checker.properties:
