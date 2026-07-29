@@ -28,6 +28,6 @@ edit checker.properties:
 `java -jar hippo-addon-checker-<version>.jar fix`
 
 
-stand it up (5 min)
+stand it up (15 min~)
 
 `mvn clean install -DskipTests && mvn -Pcargo.run -Drepo.bootstrap=full`
