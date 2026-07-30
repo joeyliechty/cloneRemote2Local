@@ -22,7 +22,8 @@ edit checker-repository:
 verify the checker tool has access to a lost+found node (15 min~)
 
 `mvn clean install -DskipTests && mvn -Pcargo.run`
-visit `/cms/console` and add/verify a `lost+found` node of type `nt:unstructured` in root.
+visit `/cms/console`
+add/verify a `lost+found` node of type `nt:unstructured` in root. Note the UUID.
 
 edit checker.properties:
 
