@@ -38,6 +38,124 @@ def _load_module_under_test():
 target = _load_module_under_test()
 
 
+class FindSiblingVenvPythonTests(unittest.TestCase):
+    def setUp(self):
+        # realpath()'d since macOS's /var -> /private/var symlink would
+        # otherwise make the raw tempdir path differ from what the
+        # implementation resolves via os.path.realpath().
+        self.script_dir = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.script_dir, ignore_errors=True)
+        self.script_path = os.path.join(self.script_dir, 'cloneRemote2Local.py')
+        with open(self.script_path, 'w') as f:
+            f.write('# stub')
+
+    def test_returns_none_when_no_sibling_venv_exists(self):
+        self.assertIsNone(target._findSiblingVenvPython(self.script_path))
+
+    def test_returns_none_when_venv_dir_exists_but_has_no_python3_binary(self):
+        os.makedirs(os.path.join(self.script_dir, '.venv', 'bin'))
+
+        self.assertIsNone(target._findSiblingVenvPython(self.script_path))
+
+    def test_returns_venv_python_path_when_it_exists(self):
+        venv_bin = os.path.join(self.script_dir, '.venv', 'bin')
+        os.makedirs(venv_bin)
+        venv_python = os.path.join(venv_bin, 'python3')
+        open(venv_python, 'w').close()
+
+        self.assertEqual(target._findSiblingVenvPython(self.script_path), venv_python)
+
+    def test_resolves_through_a_symlink_to_find_the_venv_next_to_the_real_script(self):
+        # The installed entrypoint is typically a symlink (e.g. under
+        # ~/.local/bin) pointing at the real checkout — the sibling .venv
+        # lives next to the real file, not next to the symlink.
+        venv_bin = os.path.join(self.script_dir, '.venv', 'bin')
+        os.makedirs(venv_bin)
+        venv_python = os.path.join(venv_bin, 'python3')
+        open(venv_python, 'w').close()
+
+        symlink_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, symlink_dir, ignore_errors=True)
+        symlink_path = os.path.join(symlink_dir, 'clone-remote2local')
+        os.symlink(self.script_path, symlink_path)
+
+        self.assertEqual(target._findSiblingVenvPython(symlink_path), venv_python)
+
+
+class ReexecInVenvIfNeededTests(unittest.TestCase):
+    def setUp(self):
+        # realpath()'d throughout, since macOS's /var -> /private/var
+        # symlink would otherwise make tempfile.mkdtemp()'s raw path differ
+        # from what the implementation resolves via os.path.realpath().
+        self.script_dir = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.script_dir, ignore_errors=True)
+        self.script_path = os.path.join(self.script_dir, 'cloneRemote2Local.py')
+        with open(self.script_path, 'w') as f:
+            f.write('# stub')
+        self.venv_bin = os.path.join(self.script_dir, '.venv', 'bin')
+        os.makedirs(self.venv_bin)
+        self.venv_python = os.path.join(self.venv_bin, 'python3')
+        open(self.venv_python, 'w').close()
+
+    def test_does_nothing_when_deps_already_importable(self):
+        mocked_execv = mock.Mock()
+
+        target._reexecInVenvIfNeeded(self.script_path, mocked_execv, lambda: None)
+
+        mocked_execv.assert_not_called()
+
+    def test_reexecs_via_sibling_venv_when_deps_missing(self):
+        def _fail():
+            raise ImportError('nope')
+
+        mocked_execv = mock.Mock()
+        target._reexecInVenvIfNeeded(self.script_path, mocked_execv, _fail)
+
+        mocked_execv.assert_called_once_with(self.venv_python, [self.venv_python] + sys.argv)
+
+    def test_does_nothing_when_deps_missing_and_no_sibling_venv(self):
+        shutil.rmtree(os.path.join(self.script_dir, '.venv'))
+
+        def _fail():
+            raise ImportError('nope')
+
+        mocked_execv = mock.Mock()
+        target._reexecInVenvIfNeeded(self.script_path, mocked_execv, _fail)
+
+        mocked_execv.assert_not_called()
+
+    def test_does_nothing_when_already_running_under_that_venv(self):
+        # A venv's python3 is commonly a symlink to the system interpreter
+        # rather than a copy, so sys.executable's realpath alone can't
+        # distinguish "running under the venv" from "running system
+        # python" — sys.prefix (set from pyvenv.cfg at interpreter
+        # startup) is the correct signal, and is what this must check.
+        def _fail():
+            raise ImportError('nope')
+
+        venv_dir = os.path.dirname(self.venv_bin)
+        mocked_execv = mock.Mock()
+        with mock.patch.object(target.sys, 'prefix', venv_dir):
+            target._reexecInVenvIfNeeded(self.script_path, mocked_execv, _fail)
+
+        mocked_execv.assert_not_called()
+
+    def test_reexecs_even_when_the_venv_python_is_a_symlink_to_system_python(self):
+        # Regression check for the bug above: sys.executable's realpath
+        # can equal the venv python's realpath (symlink to the same
+        # system binary) while sys.prefix still correctly shows we are
+        # NOT running under the venv — that must still trigger a reexec.
+        def _fail():
+            raise ImportError('nope')
+
+        mocked_execv = mock.Mock()
+        with mock.patch.object(target.sys, 'executable', os.path.realpath(self.venv_python)), \
+                mock.patch.object(target.sys, 'prefix', '/usr/local'):
+            target._reexecInVenvIfNeeded(self.script_path, mocked_execv, _fail)
+
+        mocked_execv.assert_called_once_with(self.venv_python, [self.venv_python] + sys.argv)
+
+
 class DiffDirectoriesTests(unittest.TestCase):
     def setUp(self):
         self.left = tempfile.mkdtemp()

@@ -1,8 +1,58 @@
 #!/usr/bin/env python3
+import os
+import sys
+
+
+def _findSiblingVenvPython(scriptPath):
+    """Path to a sibling .venv's python3 executable, or None if there
+    isn't one next to scriptPath (resolved through symlinks, since the
+    installed entrypoint is typically a symlink into the real checkout)."""
+    venvPython = os.path.join(os.path.dirname(os.path.realpath(scriptPath)), '.venv', 'bin', 'python3')
+    return venvPython if os.path.isfile(venvPython) else None
+
+
+def _reexecInVenvIfNeeded(scriptPath, execv, tryImport):
+    """Transparently re-execs this script under a sibling .venv's python3
+    when the current interpreter can't import required third-party
+    dependencies but that venv can.
+
+    #!/usr/bin/env python3 makes the script portable across machines, but
+    on its own it means whoever set up a local .venv has to remember to
+    activate it before every run. This restores that "just works"
+    convenience without hardcoding any one person's venv path.
+    """
+    try:
+        tryImport()
+        return
+    except ImportError:
+        pass
+    venvPython = _findSiblingVenvPython(scriptPath)
+    if venvPython is None:
+        return
+    # A venv's python3 is commonly a symlink to the system interpreter
+    # rather than a copy, so comparing sys.executable's realpath can't
+    # reliably tell "running under this venv" from "running system
+    # python" — sys.prefix (set from pyvenv.cfg at interpreter startup)
+    # is the correct signal, and avoids re-exec'ing in an infinite loop
+    # if the venv itself is somehow still missing the dependencies.
+    venvDir = os.path.dirname(os.path.dirname(venvPython))
+    if os.path.realpath(sys.prefix) == os.path.realpath(venvDir):
+        return
+    execv(venvPython, [venvPython] + sys.argv)
+
+
+if __name__ == '__main__':
+    def _tryImportThirdPartyDeps():
+        import requests  # noqa: F401
+        from dateutil import parser  # noqa: F401
+        from tqdm import tqdm  # noqa: F401
+
+    _reexecInVenvIfNeeded(__file__, os.execv, _tryImportThirdPartyDeps)
+
+
 import json
 import argparse
 import requests
-import os
 import glob
 import time
 import logging
@@ -10,7 +60,6 @@ from dateutil import parser
 from tqdm import tqdm
 from shutil import which
 import subprocess
-import sys
 import tarfile
 import filecmp
 import getpass
