@@ -19,10 +19,16 @@ edit checker-repository:
 
 `java -jar hippo-addon-checker-<version>.jar props > checker.properties`
 
+verify the checker tool has access to a lost+found node (15 min~)
+
+`mvn clean install -DskipTests && mvn -Pcargo.run`
+visit `/cms/console` and add/verify a `lost+found` node of type `nt:unstructured` in root.
+
 edit checker.properties:
 
-> `rep.config=checker-repository.xml`
-> 
+> `rep.config=checker-repository.xml #... or whatever you named the XML file`
+> `check.default.lostnfound={{lost+found node UUID}}`
+
 `java -jar hippo-addon-checker-<version>.jar check`
 
 `java -jar hippo-addon-checker-<version>.jar fix`
