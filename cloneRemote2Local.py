@@ -1,4 +1,4 @@
-#!/Users/josephliechty/Desktop/XM/cloneRemote2Local/.venv/bin/python3
+#!/usr/bin/env python3
 import json
 import argparse
 import requests
@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
  This script is meant as a jumpstart to loading a remote OD2 instance into your localhost.
  It needs a few prerequisites:
  1. python 3
- 2. requests, python-dateutil, tqdm installed via pip
+ 2. pip install -r requirements.txt (requests, python-dateutil, tqdm)
 
  Required arguments:
  1. --remoteEnv    : remote environment name
@@ -653,7 +653,7 @@ def configureLocalProjectForMysql(projectPath, user, password, database):
 
     if changed:
         log.info("Configured '%s' to read from local MySQL database '%s' "
-                 '(run `mvn clean install` before `mvn -Pcargo.run`).', projectPath, database)
+                 '(run `mvn clean install` before `mvn -Pcargo.run -Drepo.bootstrap=full`).', projectPath, database)
     return changed
 
 
@@ -899,7 +899,7 @@ def main():
             dest_user, dest_password, dest_database = loadBackupLocalMySQL(backupPath)
             log.info("Loaded '%s' into local MySQL.", backupPath)
             configureLocalProjectForMysql(LOCAL_PROJECT_PATH, dest_user, dest_password, dest_database)
-            log.info("To start the local checkout, run: mvn clean install && mvn -Pcargo.run")
+            log.info("To start the local checkout, run: mvn clean install && mvn -Pcargo.run -Drepo.bootstrap=full")
             return
 
         # --- Distribution ---
@@ -926,7 +926,7 @@ def main():
             dest_user, dest_password, dest_database = loadBackupLocalMySQL(backupPath)
             log.info("Loaded '%s' into local MySQL.", backupPath)
             configureLocalProjectForMysql(LOCAL_PROJECT_PATH, dest_user, dest_password, dest_database)
-            log.info("To start the cloned '%s' environment, run: mvn clean install && mvn -Pcargo.run", ENV)
+            log.info("To start the cloned '%s' environment, run: mvn clean install && mvn -Pcargo.run -Drepo.bootstrap=full", ENV)
         else:
             log.error("Local distribution does not match remote (see '%s' for differences); "
                       'discarding the downloaded backup/distribution since they do not '
